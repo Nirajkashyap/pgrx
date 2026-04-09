@@ -26,6 +26,7 @@ use sql_gen::{
 };
 
 mod operators;
+mod pg_bench;
 mod rewriter;
 
 /// Declare a function as `#[pg_guard]` to indicate that it is called from a Postgres `extern "C-unwind"`
@@ -134,6 +135,13 @@ pub fn pg_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     stream.into()
+}
+
+/// `#[pg_bench]` functions are in-process Criterion-driven benchmarks that run inside Postgres
+/// during `cargo pgrx bench`.
+#[proc_macro_attribute]
+pub fn pg_bench(attr: TokenStream, item: TokenStream) -> TokenStream {
+    pg_bench::pg_bench(attr, item)
 }
 
 /// Associated macro for `#[pg_test]` to provide context back to your test framework to indicate

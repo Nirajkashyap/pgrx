@@ -213,6 +213,11 @@ unsafe fn pg_guard_ffi_boundary_impl<T, F: FnOnce() -> T>(f: F) -> T {
             } else {
                 CStr::from_ptr(errdata.message).to_string_lossy().to_string()
             };
+            let domain = if errdata.domain.is_null() {
+                None
+            } else {
+                { Some(CStr::from_ptr(errdata.domain).to_string_lossy().to_string()) }
+            };
             let detail = if errdata.detail.is_null() {
                 None
             } else {
@@ -235,9 +240,12 @@ unsafe fn pg_guard_ffi_boundary_impl<T, F: FnOnce() -> T>(f: F) -> T {
             };
             let line = errdata.lineno as _;
 
-            // clean up after ourselves by freeing the result of [CopyErrorData] and restoring
-            // Postgres' understanding of where its next longjmp should go
+            // clean up after ourselves by freeing the result of [CopyErrorData], flushing the
+            // Postgres error state (so the original error no longer occupies a slot on Postgres'
+            // fixed-size errordata[] stack), and restoring Postgres' understanding of where its
+            // next longjmp should go
             pg_sys::FreeErrorData(errdata_ptr);
+            pg_sys::FlushErrorState();
             pg_sys::PG_exception_stack = prev_exception_stack;
             pg_sys::error_context_stack = prev_error_context_stack;
 
@@ -250,6 +258,7 @@ unsafe fn pg_guard_ffi_boundary_impl<T, F: FnOnce() -> T>(f: F) -> T {
                     message,
                     detail,
                     hint,
+                    domain,
                     location: ErrorReportLocation { file, funcname, line, col: 0, backtrace: None },
                 },
             }))

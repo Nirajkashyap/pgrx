@@ -424,6 +424,127 @@ pub fn interrupt_pending() -> bool {
     unsafe { crate::InterruptPending != 0 }
 }
 
+/// Send some kind of message to Postgres similar to the ereport macro, while specifying
+/// a text domain, analogous to Postgres' `ereport_domain` C macro.
+///
+/// The argument order is:
+/// - `log_level: [PgLogLevel]`
+/// - `error_code: [PgSqlErrorCode]`
+/// - `message: String`
+/// - (optional) `detail: String`
+///
+/// ## Examples
+///
+/// ```rust,no_run
+/// # use pgrx_pg_sys::ereport_domain;
+/// # use pgrx_pg_sys::elog::PgLogLevel;
+/// # use pgrx_pg_sys::errcodes::PgSqlErrorCode;
+/// ereport_domain!(PgLogLevel::ERROR, "my_extension", PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, "oh noes!");
+/// ```
+///
+/// ```rust,no_run
+/// # use pgrx_pg_sys::ereport_domain;
+/// # use pgrx_pg_sys::elog::PgLogLevel;
+/// # use pgrx_pg_sys::errcodes::PgSqlErrorCode;
+/// ereport_domain!(PgLogLevel::LOG, "my_extension", PgSqlErrorCode::ERRCODE_SUCCESSFUL_COMPLETION, "translated message");
+/// ```
+#[macro_export]
+macro_rules! ereport_domain {
+    (ERROR, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::ERROR);
+        unreachable!();
+    };
+
+    (PANIC, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::PANIC);
+        unreachable!();
+    };
+
+    (FATAL, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::FATAL);
+        unreachable!();
+    };
+
+    (WARNING, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::WARNING)
+    };
+
+    (NOTICE, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::NOTICE)
+    };
+
+    (INFO, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::INFO)
+    };
+
+    (LOG, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::LOG)
+    };
+
+    (DEBUG5, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::DEBUG5)
+    };
+
+    (DEBUG4, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::DEBUG4)
+    };
+
+    (DEBUG3, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::DEBUG3)
+    };
+
+    (DEBUG2, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::DEBUG2)
+    };
+
+    (DEBUG1, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($crate::elog::PgLogLevel::DEBUG1)
+    };
+
+    ($loglevel:expr, $domain:expr, $errcode:expr, $message:expr $(, $detail:expr)? $(,)?) => {
+        $crate::panic::ErrorReport::new($errcode, $message, $crate::function_name!())
+            .set_domain($domain)
+            $(.set_detail($detail))?
+            .report($loglevel);
+    };
+}
+
 /// If an interrupt is pending (perhaps a user-initiated "cancel query" message to this backend),
 /// this will safely abort the current transaction
 #[macro_export]

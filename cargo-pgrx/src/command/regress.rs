@@ -17,7 +17,7 @@ use pgrx_pg_config::{PgConfig, createdb, dropdb};
 use std::collections::HashSet;
 use std::env::temp_dir;
 use std::fs::{DirEntry, File};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -25,10 +25,21 @@ use std::process::{Command, ExitStatus, Stdio};
 #[derive(clap::Args, Debug, Clone)]
 #[clap(author)]
 pub(crate) struct Regress {
-    /// Do you want to run against pg13, pg14, pg15, pg16, pg17?
+    /// Positional arguments: [pgXX] [testname]
+    ///
+    /// `cargo pgrx regress` — run all tests against the default pg version
+    /// `cargo pgrx regress <testname>` — run a specific test against the default pg version
+    /// `cargo pgrx regress pgXX` — run all tests against the specified pg version
+    /// `cargo pgrx regress pgXX <testname>` — run a specific test against the specified pg version
     #[clap(env = "PG_VERSION")]
+    pub(crate) args: Vec<String>,
+
+    /// Resolved pg_version (not a CLI arg)
+    #[clap(skip)]
     pub(crate) pg_version: Option<String>,
-    /// If specified, only run tests containing this string in their names
+
+    /// Resolved test_filter (not a CLI arg)
+    #[clap(skip)]
     pub(crate) test_filter: Option<String>,
 
     /// If specified, use this database name instead of the auto-generated version of `$extname_regress`
@@ -71,9 +82,22 @@ pub(crate) struct Regress {
     #[clap(long)]
     pub(crate) postgresql_conf: Vec<String>,
 
-    /// Automatically accept output for new tests *and* overwrite output for existing-but-failed tests
+    /// Overwrite expected output for failed tests with actual output
     #[clap(long, short)]
     pub(crate) auto: bool,
+
+    /// Bootstrap a new test: run it, promote its output to expected/, and exit.
+    /// Implies --resetdb. The test's setup.sql is run first.
+    #[clap(long, value_name = "TESTNAME")]
+    pub(crate) add: Option<String>,
+
+    /// Print what would happen without doing it
+    #[clap(long)]
+    pub(crate) dry_run: bool,
+
+    /// Run the test suite this many times (default: 1)
+    #[clap(long, default_value_t = 1, value_name = "N")]
+    pub(crate) repeat: u32,
 }
 
 impl Regress {
@@ -187,78 +211,45 @@ impl Regress {
         }
     }
 
-    fn accept_new_test(
+    /// Bootstrap a new test by running it via pg_regress, promoting its output
+    /// to `expected/`, and git-adding the new file.
+    fn bootstrap_new_test(
         &self,
+        pg_config: &PgConfig,
         manifest_path: &Path,
-        test_result_output: &Path,
-        auto: bool,
+        pgregress_path: &Path,
+        dbname: &str,
+        test_file: &DirEntry,
     ) -> eyre::Result<()> {
-        if !std::io::stdin().is_terminal() {
-            panic!("not a terminal: cannot perform user interaction to accept tests")
-        }
-        let test_name = test_result_output
-            .file_stem()
-            .expect("test result output should have a stem")
-            .to_str()
-            .expect("test result output filename should be valid UTF8")
-            .to_string();
-        let test_output = std::fs::read_to_string(test_result_output)?;
+        let test_name = make_test_name(test_file);
+        let verbosity = &self.psql_verbosity.clone().unwrap_or("terse".into());
 
-        let variant_suffix: Option<String>;
+        println!("{} new test `{}`", "Bootstrapping".bold().green(), test_name.bold().cyan());
 
-        if auto {
-            variant_suffix = None;
-            println!(
-                "test `{}` is new, automatically accepting its output as expected",
-                test_name.bold().green()
-            );
-        } else {
-            println!("-----------");
-            println!("{}", test_output.white());
-            println!("test `{}` generated the above output:", test_name.bold().green());
-            eprint!("Accept [Y, n]? ");
+        if let Some(test_result_output) = create_regress_output(
+            pg_config,
+            manifest_path,
+            pgregress_path,
+            dbname,
+            test_file,
+            verbosity,
+        )? {
+            let expected_path = manifest_path_to_expected_tests_output_path(manifest_path)
+                .join(format!("{test_name}.out"));
 
-            let mut user_input = String::new();
-            std::io::stdin().read_line(&mut user_input)?;
-            let user_input = user_input.trim();
-
-            if user_input == "Y" || user_input == "y" || user_input.is_empty() {
-                variant_suffix = None
-            } else if user_input.as_bytes()[0] >= b'0' && user_input.as_bytes()[0] <= b'9' {
-                // currently secret options to create a variant file
-                // however, postgres requires the original `test_name.out` to also exist
-                variant_suffix = Some(format!("_{user_input}"));
-            } else {
-                std::process::exit(1);
-            }
-        }
-
-        let expected_path = manifest_path_to_expected_tests_output_path(manifest_path)
-            .join(format!("{test_name}{}.out", variant_suffix.unwrap_or_default()));
-
-        if expected_path.exists() {
-            println!(
-                "{} test output to {}",
-                "   Replacing".bold().green(),
-                expected_path.display().bold().cyan()
-            );
-            std::fs::copy(test_result_output, &expected_path)?;
-
-            // don't "git add" the file if it already exists
-            Ok(())
-        } else {
             println!(
                 "{} test output to {}",
                 "     Copying".bold().green(),
                 expected_path.display().bold().cyan()
             );
-            std::fs::copy(test_result_output, &expected_path)?;
-
-            // make sure to add the file to git
-            add_to_git(&expected_path)
+            std::fs::copy(&test_result_output, &expected_path)?;
+            add_to_git(&expected_path)?;
         }
+
+        Ok(())
     }
 
+    /// Returns `Ok(true)` when all tests passed, `Ok(false)` when at least one failed.
     fn run_all_tests(
         &self,
         pg_config: &PgConfig,
@@ -268,80 +259,79 @@ impl Regress {
         test_files: &[&DirEntry],
         output_files: &[&DirEntry],
         include_setup: bool,
-        auto: bool,
-    ) -> eyre::Result<()> {
+        run: u32,
+    ) -> eyre::Result<bool> {
         let output_names = output_files.iter().map(|e| make_test_name(e)).collect::<HashSet<_>>();
 
-        // look for new tests (tests without a corresponding output file)
-        let new_tests = test_files
-            .iter()
-            .filter(|entry| {
-                let test_name = make_test_name(entry);
-                !output_names.contains(&test_name)
-            })
-            .collect::<Vec<_>>();
+        // Separate tests into those with expected output and those without
+        let (ready_tests, new_tests): (Vec<&&DirEntry>, Vec<&&DirEntry>) =
+            test_files.iter().partition(|entry| output_names.contains(&make_test_name(entry)));
+        let ready_tests: Vec<&DirEntry> = ready_tests.into_iter().copied().collect();
+
+        // Report skipped tests in the same style as PASS/FAIL
+        for new_test in &new_tests {
+            let name = make_test_name(new_test);
+            println!(
+                "{} {} (use {} to bootstrap)",
+                "SKIP".bold().yellow(),
+                name,
+                "--add".bold().white()
+            );
+        }
+        let skipped_cnt = new_tests.len();
+
+        if ready_tests.is_empty() {
+            println!("passed=0 failed=0 skipped={skipped_cnt}");
+            return Ok(true);
+        }
 
         // The default verbosity is terse in order to avoid verbose log output
         // being enshrined in expected test output
         let verbosity = &self.psql_verbosity.clone().unwrap_or("terse".into());
 
-        if !new_tests.is_empty() {
-            println!(
-                "{} {} new tests, running each individually to create output",
-                "       Found".bold().green(),
-                new_tests.len()
-            );
-            for new_test in new_tests {
-                if let Some(test_result_output) = create_regress_output(
-                    pg_config,
-                    manifest_path,
-                    pgregress_path,
-                    dbname,
-                    new_test,
-                    &verbosity,
-                )? {
-                    self.accept_new_test(manifest_path, &test_result_output, auto)?;
+        // Run all tests that have expected output
+        let success =
+            run_tests(pg_config, pgregress_path, dbname, &ready_tests, verbosity, skipped_cnt)?;
+
+        if !success {
+            // Show the regression diffs path (always) and content (with -v).
+            // When repeating, rename to regression.<run>.diffs so each attempt is preserved.
+            print_regression_diffs(manifest_path, self.verbose, run, self.repeat);
+
+            if self.auto {
+                // Promote actual output to expected for failed tests
+                let results_files = self.list_results_outputs(manifest_path, include_setup)?;
+
+                println!();
+                for entry in results_files {
+                    let filename = entry
+                        .file_name()
+                        .to_str()
+                        .expect("filename should be valid UTF8")
+                        .to_owned();
+                    let expected_path =
+                        manifest_path_to_expected_tests_output_path(manifest_path).join(filename);
+
+                    if !expected_path.exists() {
+                        continue;
+                    }
+
+                    let src = std::fs::read_to_string(entry.path())?;
+                    let dst = std::fs::read_to_string(&expected_path)?;
+                    if src != dst {
+                        println!(
+                            "{} {}'s output to {}",
+                            "   Promoting".bold().yellow(),
+                            make_test_name(&entry).bold().bright_red(),
+                            expected_path.display().bold().cyan()
+                        );
+                        std::fs::copy(entry.path(), &expected_path)?;
+                    }
                 }
             }
         }
 
-        // now that all tests have outputs, run them all
-        let success = run_tests(pg_config, pgregress_path, dbname, test_files, verbosity)?;
-
-        if !success && auto {
-            // tests failed, but the user asked to `auto`matically accept their output as new output
-            let results_files = self.list_results_outputs(manifest_path, include_setup)?;
-
-            println!();
-            for entry in results_files {
-                let filename =
-                    entry.file_name().to_str().expect("filename should be valid UTF8").to_owned();
-                let expected_path =
-                    manifest_path_to_expected_tests_output_path(manifest_path).join(filename);
-
-                if !expected_path.exists() {
-                    // this is a file from `results/test-name.out` for which we don't have an expected file
-                    // we can ignore it
-                    continue;
-                }
-
-                let src = std::fs::read_to_string(entry.path())?;
-                let dst = std::fs::read_to_string(&expected_path)?;
-                if src != dst {
-                    println!(
-                        "{} {}'s output to {}",
-                        "   Promoting".bold().yellow(),
-                        make_test_name(&entry).bold().bright_red(),
-                        expected_path.display().bold().cyan()
-                    );
-                    std::fs::copy(entry.path(), &expected_path)?;
-                }
-            }
-
-            std::process::exit(1);
-        }
-
-        Ok(())
+        Ok(success)
     }
 }
 
@@ -351,6 +341,17 @@ impl CommandExecute for Regress {
         unsafe {
             std::env::set_var("PGRX_REGRESS_TESTING", "1");
         }
+
+        // Resolve positional args into pg_version and test_filter.
+        // If the first arg looks like a pg version (pgNN), it's the pg version;
+        // otherwise it's a test name filter.
+        self.resolve_args();
+
+        // --add implies --resetdb
+        if self.add.is_some() {
+            self.resetdb = true;
+        }
+
         let (_, manifest_path) = get_package_manifest(
             &self.features,
             self.package.as_deref(),
@@ -364,58 +365,307 @@ impl CommandExecute for Regress {
         self.postgresql_conf.push("client_min_messages=warning".into());
         let postgresql_conf = collect_postgresql_conf_settings(&self.postgresql_conf)?;
 
+        // --dry-run: resolve everything but don't execute
+        if self.dry_run {
+            return self.execute_dry_run(&manifest_path);
+        }
+
         // install the extension
         let (pg_config, dbname) = Run::from(&self).install(false, &postgresql_conf)?;
         let pgregress_path = pg_config.pg_regress_path()?;
 
-        if self.is_setup_sql_newer(&manifest_path) {
-            println!(
-                "{} database {} to be (re)created as `setup.sql` is newer than its expected output",
-                "     Forcing".bold().yellow(),
-                dbname.cyan()
-            );
-        }
+        let mut any_failed = false;
 
-        // NB:  the `is_test` argument for both `dropdb()` and `createdb()` is for `cargo pgrx test`,
-        // which creates its own Postgres instance and has its own port and datadir and such, so we
-        // say `false` here.
-        if self.resetdb || self.is_setup_sql_newer(&manifest_path) {
-            dropdb(&pg_config, &dbname, false, self.runas.clone())?;
-        }
-        // won't re-create it if it already exists
-        let created_db = createdb(&pg_config, &dbname, false, true, self.runas.clone())?;
-        if !created_db {
-            println!("{} existing database {dbname}", "    Re-using".bold().cyan());
-        }
+        for run in 1..=self.repeat {
+            if self.repeat > 1 {
+                println!();
+                println!("=== run {run} of {} ===", self.repeat);
+            }
 
-        // figure out what test and output files we have
-        let mut test_files = self.list_sql_tests(&manifest_path, created_db)?;
-        let output_files = self.list_expected_outputs(&manifest_path, created_db)?;
-
-        // filter tests
-        if let Some(test_filter) = self.test_filter.as_ref() {
-            test_files.retain(|entry| make_test_name(entry).contains(test_filter));
-            if test_files.is_empty() {
+            if self.is_setup_sql_newer(&manifest_path) {
                 println!(
-                    "{} no tests matching filter `{test_filter}`",
-                    "       ERROR".bold().red()
+                    "{} database {} to be (re)created as `setup.sql` is newer than its expected output",
+                    "     Forcing".bold().yellow(),
+                    dbname.cyan()
+                );
+            }
+
+            // NB:  the `is_test` argument for both `dropdb()` and `createdb()` is for `cargo pgrx test`,
+            // which creates its own Postgres instance and has its own port and datadir and such, so we
+            // say `false` here.
+            if self.resetdb || self.is_setup_sql_newer(&manifest_path) {
+                dropdb(&pg_config, &dbname, false, self.runas.clone())?;
+            }
+            // won't re-create it if it already exists
+            let created_db = createdb(&pg_config, &dbname, false, true, self.runas.clone())?;
+            if !created_db {
+                println!("{} existing database {dbname}", "    Re-using".bold().cyan());
+            }
+
+            // Handle --add: bootstrap a single new test and exit
+            if let Some(ref add_name) = self.add {
+                return self.execute_add(
+                    &pg_config,
+                    &manifest_path,
+                    &pgregress_path,
+                    &dbname,
+                    add_name,
+                    created_db,
+                );
+            }
+
+            // figure out what test and output files we have
+            let mut test_files = self.list_sql_tests(&manifest_path, created_db)?;
+            let output_files = self.list_expected_outputs(&manifest_path, created_db)?;
+
+            // filter tests
+            if let Some(test_filter) = self.test_filter.as_ref() {
+                test_files.retain(|entry| {
+                    let name = make_test_name(entry);
+                    // keep setup.sql when the database was just created — it needs to run
+                    // even when filtering to a specific test
+                    (created_db && name == "setup") || name.contains(test_filter)
+                });
+                if test_files.is_empty() {
+                    println!(
+                        "{} no tests matching filter `{test_filter}`",
+                        "       ERROR".bold().red()
+                    );
+                    std::process::exit(1);
+                }
+
+                // When the user explicitly filters, error if any matched test
+                // has no expected output (they should use --add first)
+                let output_names =
+                    output_files.iter().map(|e| make_test_name(e)).collect::<HashSet<_>>();
+                for entry in &test_files {
+                    let name = make_test_name(entry);
+                    if !output_names.contains(&name) {
+                        eprintln!(
+                            "{} test `{}` has no expected output. Run `cargo pgrx regress --add {}` first.",
+                            "       ERROR".bold().red(),
+                            name.bold().cyan(),
+                            name,
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            println!();
+            println!("--- beginning regression test run ---");
+            let success = self.run_all_tests(
+                &pg_config,
+                &manifest_path,
+                &pgregress_path,
+                &dbname,
+                &test_files.iter().collect::<Vec<_>>(),
+                &output_files.iter().collect::<Vec<_>>(),
+                created_db, // include_setup
+                run,
+            )?;
+
+            if !success {
+                any_failed = true;
+            }
+        }
+
+        if any_failed {
+            std::process::exit(1);
+        }
+
+        Ok(())
+    }
+}
+
+impl Regress {
+    /// Resolve the positional `args` vec into `pg_version` and `test_filter`.
+    ///
+    /// - `cargo pgrx regress` → both None
+    /// - `cargo pgrx regress my_test` → test_filter = Some("my_test")
+    /// - `cargo pgrx regress pg16` → pg_version = Some("pg16")
+    /// - `cargo pgrx regress pg16 my_test` → pg_version = Some("pg16"), test_filter = Some("my_test")
+    fn resolve_args(&mut self) {
+        fn looks_like_pg_version(s: &str) -> bool {
+            s.starts_with("pg") && s[2..].chars().all(|c| c.is_ascii_digit()) && s.len() > 2
+        }
+
+        match self.args.len() {
+            0 => {}
+            1 => {
+                if looks_like_pg_version(&self.args[0]) {
+                    self.pg_version = Some(self.args[0].clone());
+                } else {
+                    self.test_filter = Some(self.args[0].clone());
+                }
+            }
+            2 => {
+                if looks_like_pg_version(&self.args[0]) {
+                    self.pg_version = Some(self.args[0].clone());
+                    self.test_filter = Some(self.args[1].clone());
+                } else {
+                    eprintln!(
+                        "{} first positional argument must be a PostgreSQL version (e.g., pg16), got `{}`",
+                        "       ERROR".bold().red(),
+                        self.args[0],
+                    );
+                    std::process::exit(1);
+                }
+            }
+            _ => {
+                eprintln!(
+                    "{} too many positional arguments. Usage: cargo pgrx regress [pgXX] [testname]",
+                    "       ERROR".bold().red(),
                 );
                 std::process::exit(1);
             }
         }
+    }
 
-        println!();
-        println!("--- beginning regression test run ---");
-        self.run_all_tests(
-            &pg_config,
-            &manifest_path,
-            &pgregress_path,
-            &dbname,
-            &test_files.iter().collect::<Vec<_>>(),
-            &output_files.iter().collect::<Vec<_>>(),
-            created_db, // include_setup
-            self.auto,
-        )
+    /// Handle the --add flag: bootstrap a single new test.
+    fn execute_add(
+        &self,
+        pg_config: &PgConfig,
+        manifest_path: &Path,
+        pgregress_path: &Path,
+        dbname: &str,
+        add_name: &str,
+        created_db: bool,
+    ) -> eyre::Result<()> {
+        let test_files = self.list_sql_tests(manifest_path, created_db)?;
+        let expected_outputs = self.list_expected_outputs(manifest_path, created_db)?;
+
+        // Find the test file matching --add
+        let test_file = test_files.iter().find(|entry| make_test_name(entry) == add_name);
+        let Some(test_file) = test_file else {
+            eprintln!(
+                "{} no test file `{}.sql` found in {}",
+                "       ERROR".bold().red(),
+                add_name.bold().cyan(),
+                manifest_path_to_sql_tests_path(manifest_path).display(),
+            );
+            std::process::exit(1);
+        };
+
+        // Check if the test already has expected output
+        if expected_outputs.iter().any(|e| make_test_name(e) == add_name) {
+            eprintln!(
+                "{} test `{}` already has expected output. Use `cargo pgrx regress` to run it, \
+                or `cargo pgrx regress --auto` to update its expected output.",
+                "     WARNING".bold().yellow(),
+                add_name.bold().cyan(),
+            );
+            std::process::exit(1);
+        }
+
+        // Run setup.sql first if it exists (--add always starts with a fresh DB)
+        let setup_files = self.list_sql_tests(manifest_path, true)?;
+        let setup_entry = setup_files.iter().find(|e| make_test_name(e) == "setup");
+        if let Some(setup_entry) = setup_entry {
+            // Check if setup already has expected output; if not, bootstrap it too
+            let setup_has_output = expected_outputs.iter().any(|e| make_test_name(e) == "setup");
+            if !setup_has_output {
+                println!("{} setup.sql (no expected output yet)", "Bootstrapping".bold().green(),);
+                self.bootstrap_new_test(
+                    pg_config,
+                    manifest_path,
+                    pgregress_path,
+                    dbname,
+                    setup_entry,
+                )?;
+            } else {
+                // Run setup.sql normally to establish schema/data
+                let verbosity = &self.psql_verbosity.clone().unwrap_or("terse".into());
+                run_tests(pg_config, pgregress_path, dbname, &[&setup_entry], verbosity, 0)?;
+            }
+        }
+
+        // Bootstrap the requested test
+        self.bootstrap_new_test(pg_config, manifest_path, pgregress_path, dbname, test_file)?;
+
+        println!(
+            "\n{} test `{}` bootstrapped. Run `cargo pgrx regress` to verify.",
+            "        Done".bold().green(),
+            add_name.bold().cyan(),
+        );
+
+        Ok(())
+    }
+
+    /// Handle --dry-run: print what would happen and exit.
+    fn execute_dry_run(&self, manifest_path: &Path) -> eyre::Result<()> {
+        let extname = get_property(manifest_path, "extname")?
+            .expect("extension name property `extname` should always be known");
+        let dbname = self.dbname.clone().unwrap_or_else(|| format!("{extname}_regress"));
+        let profile = if self.release { "release" } else { "dev" };
+
+        println!("{}", "--- dry run ---".bold().cyan());
+        println!(
+            "Would build and install extension '{}' ({} profile)",
+            extname.bold().white(),
+            profile,
+        );
+
+        if let Some(ref pg_version) = self.pg_version {
+            println!("Target Postgres version: {}", pg_version.bold().white());
+        } else {
+            println!("Target Postgres version: (from Cargo.toml default features)");
+        }
+
+        if self.resetdb || self.add.is_some() {
+            println!("Would {} database '{}'", "drop and recreate".bold().yellow(), dbname.cyan(),);
+        } else {
+            println!("Would reuse existing database '{}'", dbname.cyan());
+        }
+
+        if let Some(ref add_name) = self.add {
+            let sql_path =
+                manifest_path_to_sql_tests_path(manifest_path).join(format!("{add_name}.sql"));
+            if sql_path.exists() {
+                println!("Would bootstrap new test: {}", add_name.bold().green());
+            } else {
+                println!("{} no test file `{}.sql` found", "       ERROR".bold().red(), add_name,);
+            }
+            return Ok(());
+        }
+
+        // List test files (without setup, then report)
+        let test_files = self.list_sql_tests(manifest_path, false)?;
+        let output_files = self.list_expected_outputs(manifest_path, false)?;
+        let output_names = output_files.iter().map(|e| make_test_name(e)).collect::<HashSet<_>>();
+
+        let mut ready = Vec::new();
+        let mut skipped = Vec::new();
+        for entry in &test_files {
+            let name = make_test_name(entry);
+            if let Some(ref filter) = self.test_filter {
+                if !name.contains(filter) {
+                    continue;
+                }
+            }
+            if output_names.contains(&name) {
+                ready.push(name);
+            } else {
+                skipped.push(name);
+            }
+        }
+
+        if !ready.is_empty() {
+            println!("Would run {} tests: {}", ready.len(), ready.join(", "),);
+        }
+        if !skipped.is_empty() {
+            println!(
+                "Would skip {} tests without expected output: {}",
+                skipped.len(),
+                skipped.join(", "),
+            );
+        }
+
+        if self.auto {
+            println!("Would {} failed test output to expected/", "promote".bold().yellow());
+        }
+
+        Ok(())
     }
 }
 
@@ -425,6 +675,7 @@ fn run_tests(
     dbname: &str,
     test_files: &[&DirEntry],
     verbosity: &str,
+    skipped_cnt: usize,
 ) -> eyre::Result<bool> {
     if test_files.is_empty() {
         return Ok(true);
@@ -436,7 +687,7 @@ fn run_tests(
         .parent()
         .expect("test file should be in a directory named `sql/`")
         .to_path_buf();
-    pg_regress(pg_config, pg_regress_bin, dbname, &input_dir, test_files, verbosity)
+    pg_regress(pg_config, pg_regress_bin, dbname, &input_dir, test_files, verbosity, skipped_cnt)
         .map(|status| status.success())
 }
 
@@ -457,7 +708,7 @@ fn create_regress_output(
         .expect("test file should be in a directory named `sql/`")
         .to_path_buf();
     let status =
-        pg_regress(pg_config, pg_regress_bin, dbname, &input_dir, &[test_file], verbosity)?;
+        pg_regress(pg_config, pg_regress_bin, dbname, &input_dir, &[test_file], verbosity, 0)?;
 
     if !status.success() {
         // pg_regress returned with an error code, but that is most likely because the test's output file
@@ -482,6 +733,7 @@ fn pg_regress(
     input_dir: &Path,
     tests: &[&DirEntry],
     verbosity: &str,
+    skipped_cnt: usize,
 ) -> eyre::Result<ExitStatus> {
     if tests.is_empty() {
         eyre::bail!("no tests to run");
@@ -560,7 +812,11 @@ fn pg_regress(
     let status = child.wait()?;
     let (passed_cnt, failed_cnt) =
         output_monitor.join().map_err(|_| eyre::eyre!("failed to join output monitor thread"))?;
-    println!("passed={passed_cnt} failed={failed_cnt}");
+    if skipped_cnt > 0 {
+        println!("passed={passed_cnt} failed={failed_cnt} skipped={skipped_cnt}");
+    } else {
+        println!("passed={passed_cnt} failed={failed_cnt}");
+    }
 
     #[cfg(not(target_os = "windows"))]
     {
@@ -568,6 +824,46 @@ fn pg_regress(
     }
 
     Ok(status)
+}
+
+/// Show the regression diffs path on failure. With `-v`, also print the full
+/// diff content to stderr.  When `repeat > 1`, rename the file to
+/// `regression.<run>.diffs` so each attempt's diffs are preserved.
+fn print_regression_diffs(manifest_path: &Path, verbose: u8, run: u32, repeat: u32) {
+    // pg_regress writes regression.diffs to --outputdir, which is the pg_regress/ directory
+    let diffs_path = manifest_path_to_pg_regress_dir(manifest_path).join("regression.diffs");
+    if !diffs_path.exists() {
+        return;
+    }
+
+    if verbose >= 1 {
+        if let Ok(content) = std::fs::read_to_string(&diffs_path) {
+            eprintln!();
+            eprintln!("{content}");
+        }
+    }
+
+    // When repeating, rename to regression.<run>.diffs so each run's output is preserved
+    let final_path = if repeat > 1 {
+        let renamed =
+            manifest_path_to_pg_regress_dir(manifest_path).join(format!("regression.{run}.diffs"));
+        // remove any stale file with the same name first
+        let _ = std::fs::remove_file(&renamed);
+        if let Err(e) = std::fs::rename(&diffs_path, &renamed) {
+            eprintln!(
+                "{} failed to rename regression.diffs to {}: {e}",
+                "     WARNING".bold().yellow(),
+                renamed.display()
+            );
+            diffs_path
+        } else {
+            renamed
+        }
+    } else {
+        diffs_path
+    };
+
+    eprintln!("\n{} {}", "  Diffs at".bold().red(), final_path.display().bold().cyan());
 }
 
 enum TestResult {
@@ -668,12 +964,21 @@ fn manifest_path_to_expected_tests_output_path(manifest_path: &Path) -> PathBuf 
     path.push("expected");
     path
 }
+
 fn manifest_path_to_results_output_path(manifest_path: &Path) -> PathBuf {
     let mut path = PathBuf::from(manifest_path);
     path.pop(); // pop `Cargo.toml`
     path.push("tests");
     path.push("pg_regress");
     path.push("results");
+    path
+}
+
+fn manifest_path_to_pg_regress_dir(manifest_path: &Path) -> PathBuf {
+    let mut path = PathBuf::from(manifest_path);
+    path.pop(); // pop `Cargo.toml`
+    path.push("tests");
+    path.push("pg_regress");
     path
 }
 

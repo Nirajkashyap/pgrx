@@ -29,6 +29,7 @@ Cargo subcommand for 'pgrx' to make Postgres extension development easy
 Usage: cargo pgrx [OPTIONS] <COMMAND>
 
 Commands:
+  bench         Run in-process benchmarks for this crate
   init          Initialize pgrx development environment for the first time
   info          Provides information about pgrx-managed development environment
   start         Start a pgrx-managed Postgres instance
@@ -43,6 +44,8 @@ Commands:
   test          Run the test suite for this crate
   get           Get a property from the extension control file
   cross         Commands having to do with cross-compilation. (Experimental)
+  upgrade       Upgrade pgrx crate versions in `Cargo.toml`. Defaults to latest
+  regress       Run the regression test suite for this crate
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -54,7 +57,7 @@ Options:
 ## Environment Variables
 
 - `PGRX_HOME` - Defaults to "${HOME}/.pgrx/" if not set.
-- `PGRX_BUILD_FLAGS` - If set during `cargo pgrx run/test/install`, these additional flags are passed to `cargo build` while building the extension
+- `PGRX_BUILD_FLAGS` - If set during `cargo pgrx run/test/install/package/bench`, these additional flags are passed to `cargo build` while building the extension
 - `PGRX_BUILD_VERBOSE` - Set to true to enable verbose "build.rs" output -- useful for debugging build issues
 - `HTTPS_PROXY` - If set during `cargo pgrx init`, it will download the Postgres sources using these proxy settings. For more details refer to the [env_proxy crate documentation](https://docs.rs/env_proxy/*/env_proxy/fn.for_url.html).
 - `PGRX_IGNORE_RUST_VERSIONS` - Set to true to disable the `rustc` version check we have when performing schema generation (schema generation requires the same version of `rustc` be used to build `cargo-pgrx` as the crate in question).
@@ -525,41 +528,171 @@ Options:
   -V, --version                        Print version
 ```
 
+## Benchmarking with In-Process Benches
+
+`cargo pgrx bench ${VERSION}` runs `#[pg_bench]` benchmarks inside Postgres backends using the
+same managed Postgres instance that `cargo pgrx run` uses.
+
+Unlike `cargo pgrx test`, this is not an ephemeral test harness. Benchmarks are installed into a
+managed benchmark database, by default named `$extname_benches`, and their historical results are
+stored there as well.
+
+The intended authoring model is:
+
+```rust
+#[cfg(feature = "pg_bench")]
+#[pg_schema]
+mod benches {
+    use pgrx::prelude::*;
+    use pgrx_bench::{Bencher, black_box};
+
+    #[pg_bench]
+    fn bench_hello(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(crate::hello());
+        });
+    }
+}
+```
+
+`cargo pgrx bench` automatically enables the `pg_bench` feature, builds in `--release` mode by
+default, installs the extension artifacts using the normal install pipeline, refreshes the
+extension in the benchmark database, and then runs each benchmark in-process.
+
+Key behaviors:
+
+- benchmark functions run inside a backend, not over an external SQL client loop
+- benchmark side effects are rolled back after each benchmark invocation
+- benchmark results are stored in a runner-owned `pgrx_bench` schema so history survives extension refreshes
+- the CLI records environment metadata, `pg_settings`, run groups, and comparison targets
+- the CLI prints the benchmark backend PID before benchmark execution starts
+- the CLI prints which benchmark is currently running and the effective settings for that benchmark
+
+You can list benchmarks and their settings with:
+
+```console
+$ cargo pgrx bench --list
+bench_normalize_phrase [transaction=shared, setup=none, sample_size=100, warm_up=3000ms, measurement=5000ms, nresamples=100000, noise_threshold=0.01, significance_level=0.05]
+bench_spi_insert_batch [transaction=subtransaction_per_batch, setup=prepare_spi_fixture, sample_size=50, warm_up=3000ms, measurement=2000ms, nresamples=100000, noise_threshold=0.01, significance_level=0.05]
+```
+
+To run a single benchmark:
+
+```console
+$ cargo pgrx bench pg16 bench_normalize_phrase
+```
+
+To print the backend PID and wait before benchmark execution starts, which is handy when attaching
+`samply`, `perf`, `lldb`, or another external profiler/debugger:
+
+```console
+$ cargo pgrx bench --wait 10
+```
+
+`--wait` is measured in seconds, is honored after the backend PID is printed, and the CLI tells
+you when it has started waiting.
+
+To name the current run group and compare it against another group:
+
+```console
+$ cargo pgrx bench --group-name before-rewrite
+$ cargo pgrx bench --group-name after-rewrite --compare-group before-rewrite
+```
+
+To emit the final summary as JSON:
+
+```console
+$ cargo pgrx bench --json
+```
+
+To render a read-only history report from the benchmark database, using the last 10 groups per
+benchmark and leaving the managed Postgres instance running:
+
+```console
+$ cargo pgrx bench --report
+$ cargo pgrx bench bench_normalize_phrase --report
+```
+
+`--report` starts the managed Postgres instance if needed, skips build/install/extension refresh,
+reads the persisted `pgrx_bench` history, and renders colored ASCII bars. Rows marked with `*`
+have broad drift from that benchmark's recorded baseline (for example profile, Postgres version,
+cargo features, or nondefault `pg_settings`).
+
+`cargo pgrx bench` is meant for in-process performance work on extension code. It is not a
+replacement for `cargo pgrx test` or `cargo pgrx regress`, and it is not a client-side SQL load
+testing tool.
+
+```console
+$ cargo pgrx bench --help
+Usage: cargo pgrx bench [OPTIONS] [ARGS]...
+
+Arguments:
+  [ARGS]...  Positional arguments: [pgXX] [benchname] [env: PG_VERSION=]
+
+Options:
+      --dbname <DBNAME>
+          If specified, use this database name instead of `$extname_benches`
+      --group-name <GROUP_NAME>
+          Unique name for this benchmark group
+  -v, --verbose...
+          Enable info logs, -vv for debug, -vvv for trace
+      --compare-group <COMPARE_GROUP>
+          Named benchmark group to compare against
+      --resetdb
+          Recreate the benchmark database before running
+      --cascade
+          Use CASCADE when dropping the extension during refresh
+      --list
+          List discovered benchmark wrappers and exit
+      --report
+          Render a read-only history report from the benchmark database
+      --json
+          Emit the final summary as JSON
+      --wait <SECONDS>
+          Sleep for this many seconds after printing the backend PID and before starting benchmarks
+          [default: 0]
+  -p, --package <PACKAGE>
+          Package to build (see `cargo help pkgid`)
+      --manifest-path <MANIFEST_PATH>
+          Path to Cargo.toml
+      --debug
+          Compile for debug mode instead of the default release mode
+      --profile <PROFILE>
+          Specific profile to use (conflicts with `--debug`)
+      --all-features
+          Activate all available features
+      --no-default-features
+          Do not activate the `default` feature
+  -F, --features <FEATURES>
+          Space-separated list of features to activate
+      --target <TARGET>
+      --postgresql-conf <POSTGRESQL_CONF>
+          Custom `postgresql.conf` settings in the form of `key=value`
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
 ## Testing with Regression Tests
 
 pgrx supports a regression test system very similar to the one prescribed by Postgres' `pg_regress` tool.  In fact, pgrx uses `pg_regress` to run the regression tests.
 
-`cargo pgrx regress` is used to run the regression tests.  It has a number of options similar to `cargo pgrx test`:
+`cargo pgrx regress` is used to run the regression tests.  It has a number of options similar to `cargo pgrx test`.
 
-```console
-$ cargo pgrx regress --help
-Run the regression test suite for this crate
+Key flags:
 
-Usage: cargo pgrx regress [OPTIONS] [PG_VERSION] [TEST_FILTER]
-
-Arguments:
-  [PG_VERSION]   Do you want to run against pg13, pg14, pg15, pg16, pg17? [env: PG_VERSION=]
-  [TEST_FILTER]  If specified, only run tests containing this string in their names
-
-Options:
-      --dbname <DBNAME>                    If specified, use this database name instead of the auto-generated version of `$extname_regress`
-      --resetdb                            Recreate the test database, even if it already exists
-  -v, --verbose...                         Enable info logs, -vv for debug, -vvv for trace
-  -p, --package <PACKAGE>                  Package to build (see `cargo help pkgid`)
-      --manifest-path <MANIFEST_PATH>      Path to Cargo.toml
-  -r, --release                            compile for release mode (default is debug)
-      --profile <PROFILE>                  Specific profile to use (conflicts with `--release`)
-  -n, --no-schema                          Don't regenerate the schema
-      --runas <USER>                       Use `sudo` to initialize and run the Postgres test instance as this system user
-      --pgdata <DIR>                       Initialize the test database cluster here, instead of the default location.  If used with `--runas`, then it must be writable by the user
-      --all-features                       Activate all available features
-      --no-default-features                Do not activate the `default` feature
-  -F, --features <FEATURES>                Space-separated list of features to activate
-      --postgresql-conf <POSTGRESQL_CONF>  Custom `postgresql.conf` settings in the form of `key=value`, ie `log_min_messages=debug1`
-  -a, --auto                               Automatically accept output for new tests *and* overwrite output for existing-but-failed tests
-  -h, --help                               Print help
-  -V, --version                            Print version
-```
+| Flag | Purpose                                                                                      |
+|------|----------------------------------------------------------------------------------------------|
+| `--resetdb` | Drop and recreate the test database (recommended for reproducible runs)                      |
+| `--add <name>` | Bootstrap a new test — implies `--resetdb`, runs `setup.sql`, promotes output to `expected/` |
+| `-t` / `--test-filter <string>` | Only run tests whose names contain this string                                               |
+| `-a` / `--auto` | Overwrite expected output for failed tests with actual output                                |
+| `-v` / `--verbose` | Print regression diffs to stderr on failure                                                  |
+| `--dry-run` | Print what would happen without doing it                                                     |
+| `--repeat <N>` | Run the entire configuration N times (default: 1)                                            |
+| `-p` / `--package <name>` | Package to build (auto-detected in workspaces with a single pgrx extension)                  |
+| `[PG_VERSION]` | Postgres version (e.g., `pg18`). Optional — defaults to Cargo.toml's default feature         |
 
 Regression tests are split into `*.sql` files and `*.out` files.  The files themselves are organized into separate directories rooted at `./tests/pg_regress`.
 
@@ -590,75 +723,51 @@ $ tree
 
 `setup.sql` is a special test in that it's run first, by itself, whenever the test database is first created, or reset using the `--resetdb` argument.
 
-When creating a new test, first make the `.sql` file in `./tests/pg_regress/sql/` and then run `cargo pgrx regress`.  pgrx will detect that the file is new and interactively prompt you to add its output, automatically adding it to git (if the directory is managed by git).
-
-For example,
+When creating a new test, first make the `.sql` file in `./tests/pg_regress/sql/` and then use `--add` to bootstrap it:
 
 ```console
 $ echo "SELECT 1;" > ./tests/pg_regress/sql/example.sql
-$ cargo pgrx regress                             
-       Using DefaultFeature("pg13") and `pg_config` from  ~/.pgrx/13.20/pgrx-install/bin/pg_config
-    Stopping Postgres v13
-    Building extension with features pg13
-     Running command " ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo" "build" "--lib" "--features" "pg13" "--no-default-features" "--message-format=json-render-diagnostics"
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
-  Installing extension
-     Copying control file to  ~/.pgrx/13.20/pgrx-install/share/postgresql/extension/range.control
-     Copying shared library to  ~/.pgrx/13.20/pgrx-install/lib/postgresql/range.so
-  Discovered 9 SQL entities: 0 schemas (0 unique), 9 functions, 0 types, 0 enums, 0 sqls, 0 ords, 0 hashes, 0 aggregates, 0 triggers
-  Rebuilding pgrx_embed, in debug mode, for SQL generation with features pg13
-   Compiling range v0.0.0 ( ~/_work/pgrx/tests/pgrx-examples/range)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.70s
-     Writing SQL entities to  ~/.pgrx/13.20/pgrx-install/share/postgresql/extension/range--0.1.0.sql
-    Finished installing range
-    Starting Postgres v13 on port 28813
-    Re-using existing database range_regress
-       Found 1 new tests, running each individually to create output
-     Running command cd " ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" && env -u PGDATABASE -u PGHOST -u PGPORT -u PGUSER " ~/.pgrx/13.20/pgrx-install/lib/postgresql/pgxs/src/test/regress/pg_regress" "--host" "localhost" "--port" "28813" "--use-existing" "--dbname=range_regress" "--inputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "--outputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "example" "--launcher=/tmp/pgrx-pg_regress-runner-2940893.sh"
------------
-SELECT 1;
- ?column? 
-----------
-        1
-(1 row)
-
-
-test `example` generated the above output:
-Accept [Y, n]? 
+$ cargo pgrx regress --add example
 ```
 
-Typing `Y` (or just pressing return) will copy the test output to the proper location, `./tests/pg_regress/expected/example.out` and then run the entire test suite:
+This will:
+1. Drop and recreate the test database (`--add` implies `--resetdb`)
+2. Run `setup.sql` to establish schema/data
+3. Run the new test
+4. Copy its output to `./tests/pg_regress/expected/example.out`
+5. `git add` the new expected output file
+
+After bootstrapping, verify the test passes by running the full suite:
 
 ```console
-...
-test `example` generated the above output:
-Accept [Y, n]? y
-     Copying test output to  ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress/expected/example.out
-     Running command cd " ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" && env -u PGDATABASE -u PGHOST -u PGPORT -u PGUSER " ~/.pgrx/13.20/pgrx-install/lib/postgresql/pgxs/src/test/regress/pg_regress" "--host" "localhost" "--port" "28813" "--use-existing" "--dbname=range_regress" "--inputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "--outputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "example" "make_range" "store_ranges" "--launcher=/tmp/pgrx-pg_regress-runner-2940893.sh"
-(using postmaster on localhost, port 28813)
-============== running regression test queries        ==============
-test example                      ... ok            6 ms
-test make_range                   ... ok           18 ms
-test store_ranges                 ... ok           20 ms
-
-=====================
- All 3 tests passed. 
-=====================
+$ cargo pgrx regress --resetdb
 ```
 
-Alternatively, you can run `cargo pgrx regress --auto` (or `-a`) to **automatically** accept the output generated by a new test.
+Tests without expected output are **skipped** by default during normal runs. If you use `--test-filter` to target a test that hasn't been bootstrapped yet, you'll get a clear error directing you to use `--add` first.
 
-`--auto` will **also** copy the output of **failed** tests to the `./tests/pg_regress/expected/` directory, overwriting the existing expected test output.  This is an automated version of blindly accepting different test output as the new, expected output.
+#### Updating expected output after code changes
+
+When code changes alter query output or EXPLAIN plans, use `--auto` to accept the new output:
+
+```console
+$ cargo pgrx regress --auto --resetdb
+```
+
+`--auto` overwrites expected output for **failed** tests with their actual output. Review the changes with `git diff` to verify they match the intended behavioral change. **Never manually edit `.out` files** — always let `--auto` generate them.
+
+When tests fail, the path to the `regression.diffs` file is always shown. Use `-v` to also print the full diff content inline.
 
 ### Things to Know
 
-- `setup.sql` is only executed when tests are run for the first time, or the `--resetdb` argument is used
+- `setup.sql` is only executed when tests are run for the first time, or the `--resetdb` argument is used.  This includes when running a single test with `--resetdb` — `setup.sql` will always run first to establish the database schema and data before the filtered test executes.
 - The point of `setup.sql` is to perform some heavy-weight database object creation/data-loading _only_ when the test regression database is created.
 - tests are executed in alphabetical order
+- `.sql` files without a corresponding `expected/*.out` file are **skipped** during normal runs — use `--add <name>` to bootstrap new tests
 - pgrx creates a database named `$extname_regress` unless `--dbname` is used
 - Postgres' documentation for `pg_regress` [begins here](https://www.postgresql.org/docs/current/regress.html).  While pgrx does not support every knob and dial, its organization is largely compatible (PRs welcome to enhance features)
-- to regenerate the expected test output, delete the `./tests/pg_regress/expected/TEST_NAME.out` file and run `cargo pgrx regress`.  You'll be prompted to accept the new output and it'll automatically be run through `git add`
-- `pg_regress` uses `psql` to run each test and literally diffs the output against the expected output file.  pgrx does two things to help eliminate noise in the test output.  The first is it sets `client_min_messages=warning` when starting the Postgres instance and it also passes `-v VERBOSITY=terse` through to `psql`.   
+- to regenerate the expected test output, delete the `./tests/pg_regress/expected/TEST_NAME.out` file and re-add it with `cargo pgrx regress --add TEST_NAME`
+- `pg_regress` uses `psql` to run each test and literally diffs the output against the expected output file.  pgrx does two things to help eliminate noise in the test output.  The first is it sets `client_min_messages=warning` when starting the Postgres instance and it also passes `-v VERBOSITY=terse` through to `psql`.
+- In a workspace with a single pgrx extension crate, `--package` is auto-detected — no need to specify it manually
 
 ### Diffing `psql` Output?
 
@@ -682,56 +791,10 @@ An example of an unkind test might be:
 
 ```console
 $ echo "CREATE TABLE foo();" > ./tests/pg_regress/sql/bad.sql
-$ cargo pgrx regress    
-       Using DefaultFeature("pg13") and `pg_config` from  ~/.pgrx/13.20/pgrx-install/bin/pg_config
-    Stopping Postgres v13
-    Building extension with features pg13
-     Running command " ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo" "build" "--lib" "--features" "pg13" "--no-default-features" "--message-format=json-render-diagnostics"
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
-  Installing extension
-     Copying control file to  ~/.pgrx/13.20/pgrx-install/share/postgresql/extension/range.control
-     Copying shared library to  ~/.pgrx/13.20/pgrx-install/lib/postgresql/range.so
-  Discovered 9 SQL entities: 0 schemas (0 unique), 9 functions, 0 types, 0 enums, 0 sqls, 0 ords, 0 hashes, 0 aggregates, 0 triggers
-  Rebuilding pgrx_embed, in debug mode, for SQL generation with features pg13
-   Compiling range v0.0.0 ( ~/_work/pgrx/tests/pgrx-examples/range)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
-     Writing SQL entities to  ~/.pgrx/13.20/pgrx-install/share/postgresql/extension/range--0.1.0.sql
-    Finished installing range
-    Starting Postgres v13 on port 28813
-    Re-using existing database range_regress
-       Found 1 new tests, running each individually to create output
-     Running command cd " ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress" && env -u PGDATABASE -u PGHOST -u PGPORT -u PGUSER " ~/.pgrx/13.20/pgrx-install/lib/postgresql/pgxs/src/test/regress/pg_regress" "--host" "localhost" "--port" "28813" "--use-existing" "--dbname=range_regress" "--inputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "--outputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "bad" "--launcher=/tmp/pgrx-pg_regress-runner-2947999.sh"
------------
-CREATE TABLE foo();
-
-test `bad` generated the above output:
-Accept [Y, n]? 
+$ cargo pgrx regress --add bad
 ```
 
-That looks like the perfect output, so we accept it:
-
-```console
-...
-test `bad` generated the above output:
-Accept [Y, n]? Y
-     Copying test output to  ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress/expected/bad.out
-     Running command cd " ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress" && env -u PGDATABASE -u PGHOST -u PGPORT -u PGUSER " ~/.pgrx/13.20/pgrx-install/lib/postgresql/pgxs/src/test/regress/pg_regress" "--host" "localhost" "--port" "28813" "--use-existing" "--dbname=range_regress" "--inputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "--outputdir= ~/_work/pgrx/tests/pgrx-examples/range/pg_regress" "bad" "make_range" "store_ranges" "--launcher=/tmp/pgrx-pg_regress-runner-2947999.sh"
-(using postmaster on localhost, port 28813)
-============== running regression test queries        ==============
-test bad                          ... FAILED        5 ms
-test make_range                   ... ok           18 ms
-test store_ranges                 ... ok           19 ms
-
-======================
- 1 of 3 tests failed. 
-======================
-
-The differences that caused some tests to fail can be viewed in the
-file " ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress/regression.diffs".  A copy of the test summary that you see
-above is saved in the file " ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress/regression.out".
-```
-
-And you see the `bad` test immediately failed!  To see how it failed, look at the `./tests/pg_regress/regression.diffs` file:
+Then on a second run (without `--resetdb`), the `CREATE TABLE` will fail because the table already exists. You'd see the regression diffs printed inline:
 
 ```console
 $ diff -U3  ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress/expected/bad.out  ~/_work/pgrx/tests/pgrx-examples/range/tests/pg_regress/results/bad.out
@@ -876,7 +939,7 @@ the extensions `.control` file.  Postgres will then execute the scripts along th
 It is your responsibility to hand-write these extension upgrade scripts in whatever manner would allow Postgres to update
 your extension from one version to the next.  pgrx has no ability to auto-generate these scripts.
 
-While pgrx does not generate these upgrade scripts, it does now about them and all pgrx commands (`cargo pgrx test/run/install/package`) 
+While pgrx does not generate these upgrade scripts, it does know about them and all pgrx commands (`cargo pgrx test/run/install/package/bench`) 
 that generate extension artifacts will automatically copy these files, and only these files, from the `./sql` directory 
 to their final destination as dictated by `pg_config`.
 
